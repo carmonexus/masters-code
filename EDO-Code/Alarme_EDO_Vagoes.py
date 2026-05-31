@@ -8,15 +8,37 @@ zeta = 0.10
 c = 2 * zeta * np.sqrt(k * m)
 F0 = 22800
 omega = 6
-
-# Limites operacionais
-LIMITE_VARIACAO_REL = 0.30   # 30 % de desvio relativo entre pontos
-LIMITE_RMS_PONTO_G = 0.40    # RMS médio do ponto considerado alto
+G = 9.81  # m/s²
 
 
 def amplitude_edo():
-    """Amplitude teórica em regime permanente (seção 6.2)."""
+    """Amplitude teórica em regime permanente na frequência de operação (seção 6.2)."""
     return F0 / np.sqrt((k - m * omega ** 2) ** 2 + (c * omega) ** 2)
+
+
+def amplitude_aceleracao_rms_ressonancia():
+    """Aceleração RMS teórica na ressonância (ω = ωₙ), em múltiplos de g.
+
+    Na ressonância, o termo (k − m·ωₙ²) → 0 e a amplitude de deslocamento atinge
+    o máximo teórico A_max = F₀ / (c·ωₙ). A aceleração de pico é ωₙ²·A_max e seu
+    valor RMS é (ωₙ²·A_max) / √2. É a referência física para o gatilho absoluto.
+    """
+    omega_n = np.sqrt(k / m)
+    A_max = F0 / (c * omega_n)
+    a_pico = omega_n ** 2 * A_max
+    a_rms = a_pico / np.sqrt(2)
+    return a_rms / G
+
+
+# Limites operacionais
+LIMITE_VARIACAO_REL = 0.30   # 30 % de variação relativa do RMS entre pontos
+LIMITE_RMS_PONTO_G = 0.40    # RMS médio do ponto considerado alto (defeito da via)
+
+# Limite absoluto por vagão: derivado da EDO da seção 6.2.
+# Considera-se ALERTA quando o RMS observado atinge 50 % da aceleração RMS
+# teórica que o sistema produziria operando na frequência natural ωₙ.
+FATOR_LIMITE_RESSONANCIA = 0.50
+LIMITE_RMS_VAGAO_G = FATOR_LIMITE_RESSONANCIA * amplitude_aceleracao_rms_ressonancia()
 
 
 def descritores_por_passagem(df: pd.DataFrame) -> pd.DataFrame:
@@ -32,8 +54,18 @@ def descritores_por_passagem(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def avaliar_vagoes(desc: pd.DataFrame) -> pd.DataFrame:
-    """Para cada vagão, mede a variação relativa do RMS entre os pontos da malha.
-    Compara também a amplitude medida com a referência teórica da EDO."""
+    """Avalia cada vagão por DOIS gatilhos independentes:
+
+    1. **Gatilho relativo**: variação > LIMITE_VARIACAO_REL entre pontos da malha
+       → captura defeitos LOCALIZADOS (uma roda com flat spot, p.ex.).
+    2. **Gatilho absoluto**: RMS máximo > LIMITE_RMS_VAGAO_G (derivado da EDO)
+       → captura proximidade da ressonância ou desgaste GENERALIZADO; o limite
+       é 50 % da aceleração RMS teórica do sistema em ω = ωₙ (seção 6.2).
+
+    Ambos os critérios são complementares: o primeiro nunca detectaria um vagão
+    operando em ressonância (vibração alta em todos os pontos, variação ≈ 0); o
+    segundo nunca detectaria um defeito de roda esporádico (RMS médio normal).
+    """
     A_ref_mm = 1000 * amplitude_edo()
     relatorio = []
     for vagao, g in desc.groupby('vagao_id'):
@@ -41,15 +73,30 @@ def avaliar_vagoes(desc: pd.DataFrame) -> pd.DataFrame:
         if len(rms) < 2:
             continue
         media = float(np.mean(rms))
-        variacao_rel = (float(np.max(rms)) - float(np.min(rms))) / media
-        status = 'ALERTA' if variacao_rel > LIMITE_VARIACAO_REL else 'NORMAL'
+        rms_max = float(np.max(rms))
+        rms_min = float(np.min(rms))
+        variacao_rel = (rms_max - rms_min) / media
+
+        alerta_variacao = variacao_rel > LIMITE_VARIACAO_REL
+        alerta_ressonancia = rms_max > LIMITE_RMS_VAGAO_G
+
+        if alerta_variacao and alerta_ressonancia:
+            status = 'ALERTA_DUPLO'
+        elif alerta_ressonancia:
+            status = 'ALERTA_RESSONANCIA'
+        elif alerta_variacao:
+            status = 'ALERTA_VARIACAO'
+        else:
+            status = 'NORMAL'
+
         relatorio.append({
             'vagao_id': vagao,
             'pontos': int(len(rms)),
-            'rms_min_g': float(np.min(rms)),
-            'rms_max_g': float(np.max(rms)),
+            'rms_min_g': rms_min,
+            'rms_max_g': rms_max,
             'variacao_rel': variacao_rel,
             'A_edo_mm': A_ref_mm,
+            'lim_rms_vagao_g': LIMITE_RMS_VAGAO_G,
             'status': status,
         })
     return pd.DataFrame(relatorio)
